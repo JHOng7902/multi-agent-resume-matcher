@@ -1,11 +1,17 @@
+import math
 from datetime import datetime
+from html import escape
 
+import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from agents import create_deepseek_client, run_multi_agent_workflow
 from pdf_utils import extract_text_from_pdf, extract_text_from_uploaded_file
-from utils import clean_text, extract_match_score, resolve_api_key, resolve_model, validate_required_inputs
+from report_insights import build_report_insights
+from report_pdf import build_report_pdf
+from utils import clean_text, resolve_api_key, resolve_model, validate_required_inputs
 from usage import format_usd
 
 
@@ -20,6 +26,20 @@ AGENT_LABELS = {
     "interview_preparation": "Interview Preparation",
     "final_report": "Final Report",
 }
+
+RESET_KEY_PREFIXES = (
+    "resume_text_",
+    "resume_pdf_",
+    "job_description_",
+    "job_description_file_",
+)
+
+RESET_STATE_KEYS = (
+    "agent_outputs",
+    "active_agent",
+    "focus_report",
+    "usage_history",
+)
 
 WORKFLOW_STEPS = [
     ("1", "Resume", "Provide your resume"),
@@ -93,11 +113,74 @@ def compute_step_states() -> dict:
     }
 
 
+def reset_job_matching_state(state):
+    """Reset all job matching input, upload, progress, report, and export state."""
+    state["form_nonce"] = state.get("form_nonce", 0) + 1
+    for key in list(state.keys()):
+        if key in RESET_STATE_KEYS or key.startswith(RESET_KEY_PREFIXES):
+            state.pop(key, None)
+    state["active_agent"] = None
+    state["page_nav"] = "Job Matching"
+
+
 def clear_all():
-    """Reset Job Matching inputs and report. New nonce forces fresh, empty widgets."""
-    st.session_state.form_nonce = st.session_state.get("form_nonce", 0) + 1
-    st.session_state.pop("agent_outputs", None)
-    st.session_state["active_agent"] = None
+    reset_job_matching_state(st.session_state)
+
+
+def report_export_filename(now=None) -> str:
+    now = now or datetime.now()
+    return f"job-match-report-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+
+
+@st.cache_data(show_spinner=False)
+def compile_report_pdf(report_markdown: str) -> bytes:
+    """Compile the assembled report markdown into a single PDF (cached by content)."""
+    return build_report_pdf(report_markdown, title="Multi-Agent Resume & Job Matching Report")
+
+
+def build_report_export(outputs: dict, generated_at=None) -> str:
+    generated_at = generated_at or datetime.now()
+    lines = [
+        "# Multi-Agent Resume & Job Matching Report",
+        "",
+        f"Generated: {generated_at.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "## Final Report",
+        "",
+        outputs.get("final_report", "").strip() or "No final report content is available.",
+        "",
+        "## Agent Outputs",
+        "",
+    ]
+
+    for key, label in AGENT_LABELS.items():
+        if key == "final_report":
+            continue
+        lines.extend(
+            [
+                f"### {label}",
+                "",
+                outputs.get(key, "").strip() or "No output available.",
+                "",
+            ]
+        )
+
+    usage = outputs.get("usage", {}).get("summary")
+    if usage:
+        lines.extend(
+            [
+                "## Usage Summary",
+                "",
+                f"- Model: {usage.get('model', 'N/A')}",
+                f"- Total input tokens: {usage.get('total_input_tokens', 0):,}",
+                f"- Total output tokens: {usage.get('total_output_tokens', 0):,}",
+                f"- Total tokens: {usage.get('total_tokens', 0):,}",
+                f"- Estimated cost: {format_usd(usage.get('estimated_cost_usd', 0.0))}",
+                "",
+            ]
+        )
+
+    return "\n".join(lines).strip() + "\n"
 
 
 def render_header():
@@ -273,13 +356,15 @@ def render_analysis_action(api_key, model, resume_text, job_description):
             use_container_width=True,
             icon=":material/auto_fix_high:",
             disabled=not ready,
+            key="generate_report_button",
         )
     with clear_col:
         st.button(
             "Clear All",
             use_container_width=True,
             on_click=clear_all,
-            help="Reset the resume, job description, uploads, and report on this page.",
+            help="Reset all inputs, uploads, progress, generated report, export file, and usage data.",
+            key="clear_all_inputs_button",
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -352,6 +437,7 @@ def run_analysis(api_key, model, resume_text, job_description):
         st.session_state.agent_outputs = results
         append_run_history(results["usage"])
         st.session_state.active_agent = None
+        st.session_state.focus_report = True
         overlay.empty()
         st.rerun()
     except RuntimeError as exc:
@@ -383,47 +469,170 @@ def loading_overlay_html(agent_label, current, total) -> str:
     )
 
 
+def focus_report_preview_once():
+    if not st.session_state.pop("focus_report", False):
+        return
+    components.html(
+        """
+        <script>
+        const target = window.parent.document.getElementById("report-preview");
+        if (target) {
+            target.scrollIntoView({ behavior: "smooth", block: "start" });
+            target.setAttribute("tabindex", "-1");
+            target.focus({ preventScroll: true });
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+def score_gauge_html(score, suitability, color) -> str:
+    pct = max(0, min(100, score)) if score is not None else 0
+    display = f"{score}%" if score is not None else "N/A"
+    radius = 54
+    circumference = 2 * math.pi * radius
+    dash = circumference * pct / 100
+    gap = circumference - dash
+    return (
+        '<div class="score-gauge">'
+        '<svg viewBox="0 0 140 140" role="img" aria-label="Job match score">'
+        '<circle class="gauge-track" cx="70" cy="70" r="54"></circle>'
+        f'<circle class="gauge-value" cx="70" cy="70" r="54" stroke="{color}" '
+        f'stroke-dasharray="{dash:.2f} {gap:.2f}" transform="rotate(-90 70 70)"></circle>'
+        f'<text x="70" y="72" class="gauge-num" fill="{color}">{display}</text>'
+        '<text x="70" y="92" class="gauge-sub">match score</text>'
+        "</svg>"
+        f'<div class="gauge-label" style="color:{color}">{suitability}</div>'
+        "</div>"
+    )
+
+
+def _skill_metric(col, label, value, css_class):
+    with col:
+        st.markdown(
+            f'<div class="skill-metric {css_class}"><div class="sm-value">{value}</div>'
+            f'<div class="sm-label">{label}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_skills_overview(insights):
+    counts = insights["counts"]
+    c_match, c_partial, c_missing = st.columns(3, gap="small")
+    _skill_metric(c_match, "Matched", counts["matched"], "skill-matched")
+    _skill_metric(c_partial, "Partial", counts["partial"], "skill-partial")
+    _skill_metric(c_missing, "Missing", counts["missing"], "skill-missing")
+
+    if insights["total_skills"]:
+        chart_df = pd.DataFrame(
+            {
+                "Category": ["Matched", "Partial", "Missing"],
+                "Skills": [counts["matched"], counts["partial"], counts["missing"]],
+            }
+        )
+        chart = (
+            alt.Chart(chart_df)
+            .mark_bar(cornerRadius=4, size=22)
+            .encode(
+                x=alt.X("Skills:Q", axis=alt.Axis(tickMinStep=1, title=None, grid=False)),
+                y=alt.Y("Category:N", sort=["Matched", "Partial", "Missing"], title=None),
+                color=alt.Color(
+                    "Category:N",
+                    scale=alt.Scale(
+                        domain=["Matched", "Partial", "Missing"],
+                        range=["#15934f", "#a36a13", "#d6336c"],
+                    ),
+                    legend=None,
+                ),
+                tooltip=["Category", "Skills"],
+            )
+            .properties(height=150)
+        )
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.caption("A skill breakdown appears here once the report lists matched and missing skills.")
+
+
+def render_skill_chips(skills, css_class):
+    if not skills:
+        return
+    chips = "".join(f'<span class="skill-chip {css_class}">{escape(skill)}</span>' for skill in skills)
+    st.markdown(f'<div class="skill-chip-row">{chips}</div>', unsafe_allow_html=True)
+
+
 def render_report_workspace():
     outputs = st.session_state.get("agent_outputs")
     if not outputs:
         render_empty_report_preview()
         return
 
-    final_report = outputs["final_report"]
-    score = extract_match_score(final_report) or "N/A"
+    st.markdown('<div id="report-preview" class="report-scroll-target"></div>', unsafe_allow_html=True)
+    focus_report_preview_once()
 
-    score_col, report_col = st.columns([1, 3], gap="large")
+    insights = build_report_insights(outputs)
+    final_report = outputs["final_report"]
+
+    score_col, skills_col = st.columns([1, 2], gap="large")
     with score_col:
         with st.container(border=True):
-            st.metric("Job Match Score", score)
-            st.caption("Estimated from the final report.")
+            st.markdown('<div class="report-card-title">Job Match Score</div>', unsafe_allow_html=True)
+            st.markdown(
+                score_gauge_html(insights["score"], insights["suitability"], insights["band"]),
+                unsafe_allow_html=True,
+            )
+    with skills_col:
+        with st.container(border=True):
+            st.markdown('<div class="report-card-title">Skills Overview</div>', unsafe_allow_html=True)
+            render_skills_overview(insights)
 
-    with report_col:
-        tab_score, tab_match, tab_missing, tab_resume, tab_interview, tab_agents = st.tabs(
-            [
-                "Score Overview",
-                "Matched Skills",
-                "Missing Skills",
-                "Resume Suggestions",
-                "Interview Prep",
-                "Agent Outputs",
-            ]
+    render_report_export_controls(outputs)
+    tab_score, tab_match, tab_missing, tab_resume, tab_interview, tab_agents = st.tabs(
+        [
+            "Score Overview",
+            "Matched Skills",
+            "Missing Skills",
+            "Resume Suggestions",
+            "Interview Prep",
+            "Agent Outputs",
+        ]
+    )
+
+    with tab_score:
+        st.markdown(final_report)
+    with tab_match:
+        render_skill_chips(insights["buckets"]["matched"], "skill-matched")
+        render_skill_chips(insights["buckets"]["partial"], "skill-partial")
+        st.markdown(outputs["skill_matching"])
+    with tab_missing:
+        render_skill_chips(insights["buckets"]["missing"], "skill-missing")
+        st.markdown(outputs["gap_analysis"])
+    with tab_resume:
+        st.markdown(outputs["resume_improvement"])
+    with tab_interview:
+        st.markdown(outputs["interview_preparation"])
+    with tab_agents:
+        for key, label in AGENT_LABELS.items():
+            with st.expander(label, expanded=key == "resume_analysis"):
+                st.markdown(outputs[key])
+
+
+def render_report_export_controls(outputs: dict):
+    st.markdown('<div class="report-action-row">', unsafe_allow_html=True)
+    export_col = st.columns([0.34, 0.66], gap="small")[0]
+    with export_col:
+        pdf_bytes = compile_report_pdf(build_report_export(outputs))
+        st.download_button(
+            "Export Report",
+            data=pdf_bytes,
+            file_name=report_export_filename(),
+            mime="application/pdf",
+            use_container_width=True,
+            icon=":material/picture_as_pdf:",
+            key="export_report_button",
+            help="Compile the full report and all agent outputs into one PDF.",
         )
-
-        with tab_score:
-            st.markdown(final_report)
-        with tab_match:
-            st.markdown(outputs["skill_matching"])
-        with tab_missing:
-            st.markdown(outputs["gap_analysis"])
-        with tab_resume:
-            st.markdown(outputs["resume_improvement"])
-        with tab_interview:
-            st.markdown(outputs["interview_preparation"])
-        with tab_agents:
-            for key, label in AGENT_LABELS.items():
-                with st.expander(label, expanded=key == "resume_analysis"):
-                    st.markdown(outputs[key])
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def append_run_history(usage_data: dict):
@@ -449,74 +658,185 @@ def render_usage_dashboard(model: str):
     usage_data = outputs.get("usage", default_usage_data(model))
     summary = usage_data["summary"]
     history = st.session_state.get("usage_history", [])
+    agent_usage = normalized_agent_usage(usage_data.get("agents", []))
 
-    st.markdown('<div class="section-title">Usage Dashboard</div>', unsafe_allow_html=True)
-    st.caption("Track model, token usage, and estimated API spend for this session.")
+    st.markdown(
+        '<section class="usage-dashboard">'
+        '<h2>Usage Dashboard</h2>'
+        "<p>Track model, token usage, and estimated API spend for this session.</p>"
+        "</section>",
+        unsafe_allow_html=True,
+    )
 
-    metric_cols = st.columns(4, gap="large")
+    metric_cols = st.columns(4, gap="medium")
     with metric_cols[0]:
-        render_usage_metric("Current Model", summary["model"])
+        render_usage_metric("Current Model", summary["model"], "chip", "blue", "Active for this session")
     with metric_cols[1]:
-        render_usage_metric("Total Tokens", f'{summary["total_tokens"]:,}')
+        render_usage_metric("Total Tokens", f'{summary["total_tokens"]:,}', "database", "blue", "Across all agents")
     with metric_cols[2]:
-        render_usage_metric("Estimated Spend", format_usd(summary["estimated_cost_usd"]))
+        render_usage_metric(
+            "Estimated Spend",
+            format_usd(summary["estimated_cost_usd"]),
+            "dollar",
+            "green",
+            "Approximate cost",
+        )
     with metric_cols[3]:
-        render_usage_metric("Completed Runs", str(len(history)))
+        render_usage_metric("Completed Runs", str(len(history)), "check", "green", "Successful analyses")
 
-    chart_col, table_col = st.columns([1.2, 1.8], gap="large")
+    chart_col, table_col = st.columns([1, 1], gap="medium")
     with chart_col:
         with st.container(border=True):
-            st.markdown("#### Token Usage by Agent")
-            agent_usage = usage_data["agents"]
-            if agent_usage:
-                chart_df = pd.DataFrame(
-                    {
-                        "Agent": [item["agent"] for item in agent_usage],
-                        "Input Tokens": [item["input_tokens"] for item in agent_usage],
-                        "Output Tokens": [item["output_tokens"] for item in agent_usage],
-                    }
-                ).set_index("Agent")
-                st.bar_chart(chart_df)
-            else:
-                st.info("Run an analysis to populate token usage by agent.")
+            render_token_usage_panel(agent_usage)
 
     with table_col:
         with st.container(border=True):
-            st.markdown("#### Agent Cost Breakdown")
-            if usage_data["agents"]:
-                st.dataframe(
-                    build_agent_cost_table(usage_data["agents"]),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-            else:
-                st.info("No completed agent usage is available yet.")
+            render_agent_cost_breakdown(agent_usage)
 
     with st.container(border=True):
-        note_col, button_col = st.columns([3, 1], gap="large")
-        with note_col:
-            st.markdown("#### Run History")
-            st.caption("Costs are approximate and based on configured token rates.")
-        with button_col:
-            if st.button("Clear Session Usage", use_container_width=True):
-                st.session_state.pop("usage_history", None)
-                if "agent_outputs" in st.session_state:
-                    st.session_state.agent_outputs.pop("usage", None)
-                st.rerun()
+        render_run_history_panel(history)
 
-        if history:
-            st.dataframe(pd.DataFrame(history), hide_index=True, use_container_width=True)
-        else:
-            st.info("Completed analyses will appear here during this Streamlit session.")
-
-    if st.button("Back to Job Matching"):
-        st.session_state.page_nav = "Job Matching"
-        st.rerun()
+    _, clear_col = st.columns([1.55, 0.56], gap="small")
+    with clear_col:
+        if st.button("Clear Session Usage", use_container_width=True, icon=":material/delete:"):
+            st.session_state.pop("usage_history", None)
+            if "agent_outputs" in st.session_state:
+                st.session_state.agent_outputs.pop("usage", None)
+            st.rerun()
 
 
-def render_usage_metric(label: str, value: str):
+def render_usage_metric(label: str, value: str, icon: str, accent: str, note: str):
     st.markdown(
-        f'<div class="usage-metric"><div class="usage-label">{label}</div><div class="usage-value">{value}</div></div>',
+        '<div class="usage-metric">'
+        f'<div class="usage-icon usage-icon-{accent}">{usage_icon_svg(icon)}</div>'
+        '<div>'
+        f'<div class="usage-label">{escape(label)}</div>'
+        f'<div class="usage-value usage-value-{accent}">{escape(value)}</div>'
+        f'<div class="usage-note">{escape(note)}</div>'
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def usage_icon_svg(name: str) -> str:
+    icons = {
+        "chip": '<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"></rect><path d="M9 1v4m6-4v4M9 19v4m6-4v4M1 9h4m-4 6h4m14-6h4m-4 6h4"></path><circle cx="12" cy="12" r="2"></circle></svg>',
+        "database": '<svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"></path><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"></path></svg>',
+        "dollar": '<svg viewBox="0 0 24 24"><path d="M12 2v20M17 6.5c-1.1-.9-2.7-1.5-4.4-1.5-2.6 0-4.6 1.3-4.6 3.2 0 4.8 9.5 2.2 9.5 7.5 0 2-2 3.3-4.8 3.3-2.1 0-4-.7-5.2-1.9"></path></svg>',
+        "check": '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M8 12.3l2.6 2.7L16.5 9"></path></svg>',
+    }
+    return icons.get(name, icons["chip"])
+
+
+def normalized_agent_usage(agent_usage: list[dict]) -> list[dict]:
+    if agent_usage:
+        return agent_usage
+    return [
+        {
+            "agent": label,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        }
+        for label in AGENT_LABELS.values()
+    ]
+
+
+def render_token_usage_panel(agent_usage: list[dict]):
+    max_total = max([item["total_tokens"] for item in agent_usage] + [1])
+    rows = []
+    for item in agent_usage:
+        input_pct = item["input_tokens"] / max_total * 100
+        output_pct = item["output_tokens"] / max_total * 100
+        input_label = f'{item["input_tokens"]:,}' if item["input_tokens"] else ""
+        output_label = f'{item["output_tokens"]:,}' if item["output_tokens"] else ""
+        input_style = f"width:{input_pct:.2f}%;"
+        output_style = f"width:{output_pct:.2f}%;"
+        if item["input_tokens"] == 0:
+            input_style += "padding-right:0;"
+        if item["output_tokens"] == 0:
+            output_style += "padding-right:0;"
+        rows.append(
+            '<div class="usage-bar-row">'
+            f'<div class="usage-bar-label">{escape(item["agent"])}</div>'
+            '<div class="usage-bar-track">'
+            f'<span class="usage-bar-input" style="{input_style}">{input_label}</span>'
+            f'<span class="usage-bar-output" style="{output_style}">{output_label}</span>'
+            "</div>"
+            f'<div class="usage-bar-total">{item["total_tokens"]:,}</div>'
+            "</div>"
+        )
+    st.markdown(
+        '<div class="usage-panel-heading">Token Usage by Agent <span class="info-dot">i</span></div>'
+        '<div class="usage-legend"><span><b class="legend-blue"></b>Input Tokens</span><span><b class="legend-green"></b>Output Tokens</span></div>'
+        f'<div class="usage-bars">{"".join(rows)}</div>'
+        '<div class="usage-axis"><span>0</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>'
+        '<div class="usage-axis-label">Tokens</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_agent_cost_breakdown(agent_usage: list[dict]):
+    total_input = sum(item["input_tokens"] for item in agent_usage)
+    total_output = sum(item["output_tokens"] for item in agent_usage)
+    total_tokens = sum(item["total_tokens"] for item in agent_usage)
+    total_cost = sum(item["estimated_cost_usd"] for item in agent_usage)
+    rows = "".join(
+        "<tr>"
+        f'<td>{escape(item["agent"])}</td>'
+        f'<td>{item["input_tokens"]:,}</td>'
+        f'<td>{item["output_tokens"]:,}</td>'
+        f'<td>{item["total_tokens"]:,}</td>'
+        f'<td>{format_usd(item["estimated_cost_usd"])}</td>'
+        "</tr>"
+        for item in agent_usage
+    )
+    st.markdown(
+        '<div class="usage-panel-heading">Agent Cost Breakdown</div>'
+        '<table class="usage-table">'
+        "<thead><tr><th>Agent</th><th>Input Tokens</th><th>Output Tokens</th><th>Total Tokens</th><th>Estimated Cost</th></tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "<tfoot><tr>"
+        "<td>Total</td>"
+        f"<td>{total_input:,}</td>"
+        f"<td>{total_output:,}</td>"
+        f"<td>{total_tokens:,}</td>"
+        f"<td>{format_usd(total_cost)}</td>"
+        "</tr></tfoot>"
+        "</table>"
+        '<div class="usage-warning"><span>i</span> Costs are approximate and based on configured token rates.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_run_history_panel(history: list[dict]):
+    if history:
+        rows = "".join(
+            "<tr>"
+            f'<td>{escape(str(item["Date/Time"]))}</td>'
+            f'<td>{escape(str(item["Model"]))}</td>'
+            f'<td>{int(item["Total Tokens"]):,}</td>'
+            f'<td>{escape(str(item["Estimated Cost"]))}</td>'
+            '<td><span class="status-pill">&#10003; Completed</span></td>'
+            "</tr>"
+            for item in history
+        )
+    else:
+        rows = (
+            '<tr><td colspan="5" class="empty-history">'
+            "Completed analyses will appear here during this Streamlit session."
+            "</td></tr>"
+        )
+
+    st.markdown(
+        '<div class="usage-panel-heading">Run History</div>'
+        '<table class="usage-table usage-history-table">'
+        "<thead><tr><th>Date / Time</th><th>Model</th><th>Total Tokens</th><th>Estimated Cost</th><th>Status</th></tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "</table>"
+        f'<div class="history-footnote">Showing {len(history)} of {len(history)} runs for this session.</div>',
         unsafe_allow_html=True,
     )
 
@@ -560,19 +880,13 @@ def render_empty_report_preview():
         with tab_score:
             st.info("Run the multi-agent analysis to generate the job match score and final recommendation.")
         with tab_match:
-            st.write("- SQL")
-            st.write("- Manual testing")
-            st.write("- UAT")
-            st.write("- JIRA")
+            st.info("Run the multi-agent analysis to generate the matched skills and final recommendation.")
         with tab_missing:
-            st.write("- Selenium")
-            st.write("- API testing")
-            st.write("- Automation testing")
+            st.info("Run the multi-agent analysis to generate the missing skills and final recommendation.")
         with tab_resume:
-            st.write("- Add clearer QA keywords.")
-            st.write("- Highlight test case execution and defect logging.")
+            st.info("Run the multi-agent analysis to generate the resume improvement suggestions.")
         with tab_interview:
-            st.write("- Prepare examples of manual testing, regression testing, and UAT.")
+            st.info("Run the multi-agent analysis to generate the interview preparation suggestions.")
 
 
 def inject_styles():
@@ -796,21 +1110,277 @@ def inject_styles():
             background: var(--surface);
             border: 1px solid var(--border);
             border-radius: 8px;
-            min-height: 104px;
-            padding: 1rem;
+            display: grid;
+            gap: 1rem;
+            grid-template-columns: 72px 1fr;
+            height: 148px;
+            min-height: 148px;
+            padding: 1.55rem 1.6rem;
+            place-items: center start;
+        }
+        .usage-icon {
+            align-items: center;
+            border-radius: 999px;
+            display: flex;
+            height: 72px;
+            justify-content: center;
+            width: 72px;
+        }
+        .usage-icon svg {
+            display: block;
+            height: 38px;
+            width: 38px;
+        }
+        .usage-icon svg * {
+            fill: none;
+            stroke: currentColor;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+            stroke-width: 2;
+        }
+        .usage-icon-blue {
+            background: #eaf1ff;
+            color: var(--blue);
+        }
+        .usage-icon-green {
+            background: #e6f6ef;
+            color: var(--green);
         }
         .usage-label {
-            color: var(--muted);
-            font-size: .84rem;
-            font-weight: 750;
-            margin-bottom: .45rem;
+            color: var(--navy);
+            font-size: .98rem;
+            font-weight: 850;
+            margin-bottom: .55rem;
         }
         .usage-value {
             color: var(--navy);
-            font-size: 1.45rem;
+            font-size: 1.48rem;
             font-weight: 850;
             line-height: 1.2;
-            overflow-wrap: anywhere;
+            overflow-wrap: normal;
+            white-space: nowrap;
+        }
+        .usage-value-green {
+            color: var(--green);
+        }
+        .usage-note {
+            color: var(--muted);
+            font-size: .9rem;
+            margin-top: .55rem;
+        }
+        .usage-value-green + .usage-note {
+            color: #e05f00;
+        }
+        .usage-dashboard {
+            height: 90px;
+            margin: 0rem 0 .8rem;
+        }
+        .usage-dashboard h2 {
+            color: var(--navy);
+            font-size: 1.8rem;
+            font-weight: 850;
+            line-height: 1.2;
+            margin: 0 0 .45rem;
+        }
+        .usage-dashboard p {
+            color: var(--muted);
+            font-size: 1rem;
+            margin: 0;
+        }
+        .usage-panel-heading {
+            align-items: center;
+            color: var(--navy);
+            display: flex;
+            font-size: 1.15rem;
+            font-weight: 850;
+            gap: .45rem;
+            margin: .1rem 0 .9rem;
+        }
+        .info-dot {
+            align-items: center;
+            border: 1px solid #7586a4;
+            border-radius: 999px;
+            color: #51627f;
+            display: inline-flex;
+            font-size: .72rem;
+            font-weight: 850;
+            height: 16px;
+            justify-content: center;
+            width: 16px;
+        }
+        .usage-legend {
+            color: var(--navy);
+            display: flex;
+            font-size: .9rem;
+            font-weight: 700;
+            gap: 1.6rem;
+            margin: 0 0 1.1rem;
+        }
+        .usage-legend span {
+            align-items: center;
+            display: inline-flex;
+            gap: .55rem;
+        }
+        .usage-legend b {
+            border-radius: 4px;
+            display: inline-block;
+            height: 14px;
+            width: 14px;
+        }
+        .legend-blue {
+            background: #1766e8;
+        }
+        .legend-green {
+            background: #23ad66;
+        }
+        .usage-bars {
+            display: grid;
+            gap: .52rem;
+            margin-top: .45rem;
+        }
+        .usage-bar-row {
+            align-items: center;
+            display: grid;
+            gap: .8rem;
+            grid-template-columns: 150px 1fr 58px;
+        }
+        .usage-bar-label {
+            color: var(--navy);
+            font-size: .86rem;
+            text-align: right;
+        }
+        .usage-bar-track {
+            align-items: center;
+            background: #eef3fb;
+            border-radius: 4px;
+            display: flex;
+            height: 20px;
+            overflow: hidden;
+        }
+        .usage-bar-input,
+        .usage-bar-output {
+            align-items: center;
+            color: #fff;
+            display: flex;
+            font-size: .75rem;
+            font-weight: 850;
+            height: 100%;
+            justify-content: flex-end;
+            min-width: 0;
+            overflow: hidden;
+            padding-right: .45rem;
+            white-space: nowrap;
+        }
+        .usage-bar-input {
+            background: linear-gradient(90deg, #0f65eb, #2174f5);
+        }
+        .usage-bar-output {
+            background: linear-gradient(90deg, #1ca85f, #2dbd73);
+        }
+        .usage-bar-total {
+            color: var(--navy);
+            font-size: .82rem;
+            font-weight: 850;
+            text-align: right;
+        }
+        .usage-axis {
+            color: var(--muted);
+            display: grid;
+            font-size: .8rem;
+            grid-template-columns: repeat(5, 1fr);
+            margin: .9rem 58px 0 150px;
+        }
+        .usage-axis-label {
+            color: var(--navy);
+            font-size: .85rem;
+            font-weight: 750;
+            margin-top: .35rem;
+            text-align: center;
+        }
+        .usage-table {
+            border-collapse: separate;
+            border-spacing: 0;
+            color: var(--navy);
+            font-size: .86rem;
+            overflow: hidden;
+            width: 100%;
+        }
+        .usage-table th,
+        .usage-table td {
+            border-bottom: 1px solid #dce6f2;
+            border-right: 1px solid #dce6f2;
+            padding: .36rem .58rem;
+            text-align: right;
+        }
+        .usage-table th:first-child,
+        .usage-table td:first-child {
+            text-align: left;
+        }
+        .usage-table th {
+            background: #f7faff;
+            font-weight: 850;
+        }
+        .usage-table th:first-child {
+            border-left: 1px solid #dce6f2;
+            border-radius: 7px 0 0 0;
+        }
+        .usage-table th:last-child {
+            border-radius: 0 7px 0 0;
+        }
+        .usage-table td:first-child {
+            border-left: 1px solid #dce6f2;
+        }
+        .usage-table tfoot td {
+            background: #fbfdff;
+            font-size: .92rem;
+            font-weight: 850;
+        }
+        .usage-table tfoot td:last-child {
+            color: var(--green);
+        }
+        .usage-warning {
+            background: #fff8e8;
+            border: 1px solid #f1d690;
+            border-radius: 7px;
+            color: #bf4e00;
+            font-size: .86rem;
+            font-weight: 700;
+            margin-top: .75rem;
+            padding: .65rem .8rem;
+        }
+        .usage-warning span {
+            align-items: center;
+            border: 1px solid #f97316;
+            border-radius: 999px;
+            display: inline-flex;
+            height: 16px;
+            justify-content: center;
+            margin-right: .45rem;
+            width: 16px;
+        }
+        .usage-history-table td,
+        .usage-history-table th {
+            padding: .55rem .7rem;
+        }
+        .status-pill {
+            background: #dff6e8;
+            border: 1px solid #b9e5c9;
+            border-radius: 7px;
+            color: var(--green);
+            display: inline-block;
+            font-weight: 850;
+            padding: .18rem .55rem;
+        }
+        .empty-history {
+            background: #e8f2ff;
+            color: #0054b8;
+            font-size: .95rem;
+            text-align: left !important;
+        }
+        .history-footnote {
+            color: var(--muted);
+            font-size: .9rem;
+            margin-top: .65rem;
         }
         div[data-testid="stVerticalBlockBorderWrapper"] {
             background: var(--surface);
@@ -992,6 +1562,12 @@ def inject_styles():
             font-weight: 850;
             margin: .2rem 0 1rem;
         }
+        .report-scroll-target {
+            scroll-margin-top: 120px;
+        }
+        .report-action-row {
+            margin: 0 0 .85rem;
+        }
         .stTabs [data-baseweb="tab-list"] {
             background: #f5f8fc;
             border: 1px solid #dce6f2;
@@ -1022,6 +1598,94 @@ def inject_styles():
         }
         .stAlert {
             border-radius: 8px;
+        }
+        .report-card-title {
+            color: var(--navy);
+            font-size: 1.05rem;
+            font-weight: 850;
+            margin: .1rem 0 .7rem;
+        }
+        .score-gauge {
+            align-items: center;
+            display: flex;
+            flex-direction: column;
+        }
+        .score-gauge svg {
+            height: 168px;
+            width: 168px;
+        }
+        .gauge-track {
+            fill: none;
+            stroke: #e8eef8;
+            stroke-width: 14;
+        }
+        .gauge-value {
+            fill: none;
+            stroke-linecap: round;
+            stroke-width: 14;
+        }
+        .gauge-num {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-size: 34px;
+            font-weight: 850;
+            text-anchor: middle;
+        }
+        .gauge-sub {
+            fill: var(--muted);
+            font-size: 12px;
+            font-weight: 650;
+            letter-spacing: .04em;
+            text-anchor: middle;
+        }
+        .gauge-label {
+            font-size: 1.02rem;
+            font-weight: 800;
+            margin-top: .4rem;
+        }
+        .skill-metric {
+            border: 1px solid;
+            border-radius: 10px;
+            padding: .75rem .5rem;
+            text-align: center;
+        }
+        .skill-metric .sm-value {
+            font-size: 1.6rem;
+            font-weight: 850;
+            line-height: 1;
+        }
+        .skill-metric .sm-label {
+            font-size: .78rem;
+            font-weight: 750;
+            letter-spacing: .03em;
+            margin-top: .3rem;
+        }
+        .skill-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: .4rem;
+            margin: .2rem 0 .8rem;
+        }
+        .skill-chip {
+            border: 1px solid;
+            border-radius: 999px;
+            font-size: .82rem;
+            font-weight: 700;
+            padding: .25rem .7rem;
+        }
+        .skill-metric.skill-matched, .skill-chip.skill-matched {
+            background: #e7f8ef;
+            border-color: #bfe9d1;
+            color: var(--green);
+        }
+        .skill-metric.skill-partial, .skill-chip.skill-partial {
+            background: #fef6e7;
+            border-color: #f0d9a8;
+            color: var(--amber);
+        }
+        .skill-metric.skill-missing, .skill-chip.skill-missing {
+            background: #fdeaf0;
+            border-color: #f4c2d3;
+            color: #d6336c;
         }
         .loading-overlay {
             align-items: center;
@@ -1108,6 +1772,10 @@ def inject_styles():
                 height: 48px;
                 width: 48px;
             }
+            .usage-brand-mark {
+                height: 44px;
+                width: 44px;
+            }
             .app-header h1 {
                 font-size: 1.25rem;
             }
@@ -1123,6 +1791,28 @@ def inject_styles():
             .element-container:has(div[data-testid="stRadio"]) {
                 height: auto !important;
                 overflow: visible !important;
+            }
+            .usage-dashboard {
+                height: auto;
+                margin: 1.4rem 0 1rem;
+            }
+            .usage-metric {
+                height: auto;
+                min-height: 148px;
+            }
+            .usage-value {
+                white-space: normal;
+            }
+            .usage-bar-row {
+                grid-template-columns: 1fr;
+                gap: .35rem;
+            }
+            .usage-bar-label,
+            .usage-bar-total {
+                text-align: left;
+            }
+            .usage-axis {
+                margin: .9rem 0 0;
             }
             .stepper {
                 grid-template-columns: 1fr;
